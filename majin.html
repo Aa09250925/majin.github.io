@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>麻將計台器（底/連莊）</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Noto Sans TC", sans-serif; margin: 24px; }
+    .grid { display: grid; gap: 12px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; }
+    .row { display: grid; grid-template-columns: 190px 1fr; gap: 10px; align-items: center; }
+    input, select, button { padding: 8px 10px; border-radius: 10px; border: 1px solid #bbb; }
+    button { cursor: pointer; border: 0; background: #111; color: #fff; }
+    button.secondary { background: #666; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    .muted { color: #666; font-size: 12px; }
+    .actions { display:flex; gap:10px; flex-wrap: wrap; }
+    .pill { display:inline-block; padding:2px 8px; border:1px solid #ddd; border-radius: 999px; font-size: 12px; margin-left: 6px; }
+  </style>
+</head>
+<body>
+  <h1>麻將計台器（底 / 連莊）</h1>
+  <p class="muted">結算模型：底會進入每家支付。可設定底台、連莊次數、每連加成。</p>
+
+  <div class="grid">
+    <div class="card">
+      <h2>玩家設定</h2>
+      <div class="row"><div>玩家 1</div><input id="p0" value="東" /></div>
+      <div class="row"><div>玩家 2</div><input id="p1" value="南" /></div>
+      <div class="row"><div>玩家 3</div><input id="p2" value="西" /></div>
+      <div class="row"><div>玩家 4</div><input id="p3" value="北" /></div>
+
+      <div class="row">
+        <div>台錢（每台多少）</div>
+        <input id="unit" type="number" min="1" value="10" />
+      </div>
+
+      <div class="row">
+        <div>莊家</div>
+        <select id="dealer"></select>
+      </div>
+
+      <div class="row">
+        <div>連莊次數（0=無）</div>
+        <input id="streak" type="number" min="0" value="0" />
+      </div>
+
+      <div class="row">
+        <div>每連莊加成（台）</div>
+        <input id="perStreak" type="number" min="0" value="1" />
+      </div>
+
+      <div class="row">
+        <div>底台（台）</div>
+        <input id="base" type="number" min="0" value="0" />
+      </div>
+
+      <p class="muted">
+        本局有效台數 = <b>底台</b> + <b>胡牌台數</b> + <b>(連莊次數 × 每連加成)</b>
+        <span class="pill" id="effectivePreview">有效台數：—</span>
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>本局結算</h2>
+
+      <div class="row">
+        <div>胡牌者</div>
+        <select id="winner"></select>
+      </div>
+
+      <div class="row">
+        <div>方式</div>
+        <select id="method">
+          <option value="tsumo">自摸</option>
+          <option value="ron">放槍</option>
+        </select>
+      </div>
+
+      <div class="row" id="loserRow" style="display:none;">
+        <div>放槍者</div>
+        <select id="loser"></select>
+      </div>
+
+      <div class="row">
+        <div>胡牌台數（整數）</div>
+        <input id="fan" type="number" min="0" value="1" />
+      </div>
+
+      <div class="actions">
+        <button id="settleBtn">結算本局</button>
+        <button id="undoBtn" class="secondary">復原上一局</button>
+        <button id="resetBtn" class="secondary">清空全部</button>
+      </div>
+
+      <p class="muted" id="ruleHint"></p>
+    </div>
+
+    <div class="card">
+      <h2>累計結果</h2>
+      <table>
+        <thead>
+          <tr><th>玩家</th><th>本局</th><th>累計</th></tr>
+        </thead>
+        <tbody id="scoreBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+  const state = {
+    players: ["東","南","西","北"],
+    unit: 10,
+    dealer: 0,
+    total: [0,0,0,0],
+    lastDelta: null,
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const selects = ["dealer","winner","loser"].map($);
+  const loserRow = $("loserRow");
+  const ruleHint = $("ruleHint");
+  const scoreBody = $("scoreBody");
+  const effectivePreview = $("effectivePreview");
+
+  function refreshPlayersFromInputs() {
+    state.players = [0,1,2,3].map(i => $("p"+i).value.trim() || ("玩家"+(i+1)));
+  }
+
+  function fillSelectOptions() {
+    selects.forEach(sel => {
+      const cur = sel.value;
+      sel.innerHTML = "";
+      state.players.forEach((name, idx) => {
+        const opt = document.createElement("option");
+        opt.value = String(idx);
+        opt.textContent = name;
+        sel.appendChild(opt);
+      });
+      if (cur !== "" && Number(cur) >= 0 && Number(cur) < 4) sel.value = cur;
+    });
+  }
+
+  function fmt(n) {
+    const sign = n > 0 ? "+" : "";
+    return sign + n.toString();
+  }
+
+  function renderScores(delta = [0,0,0,0]) {
+    scoreBody.innerHTML = "";
+    for (let i=0;i<4;i++) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${state.players[i]}</td>
+        <td>${fmt(delta[i])}</td>
+        <td>${fmt(state.total[i])}</td>
+      `;
+      scoreBody.appendChild(tr);
+    }
+  }
+
+  function methodChanged() {
+    const m = $("method").value;
+    loserRow.style.display = (m === "ron") ? "" : "none";
+    updateRuleHint();
+  }
+
+  function readSettings() {
+    const unit = Number($("unit").value) || 10;
+    const base = Math.max(0, Number($("base").value) || 0);
+    const streak = Math.max(0, Number($("streak").value) || 0);
+    const perStreak = Math.max(0, Number($("perStreak").value) || 0);
+    const fan = Math.max(0, Number($("fan").value) || 0);
+    return { unit, base, streak, perStreak, fan };
+  }
+
+  function effectiveFan({base, streak, perStreak, fan}) {
+    return base + fan + (streak * perStreak);
+  }
+
+  function updateRuleHint() {
+    const { unit, base, streak, perStreak, fan } = readSettings();
+    const eff = effectiveFan({base, streak, perStreak, fan});
+    effectivePreview.textContent = `有效台數：${eff}`;
+
+    const m = $("method").value;
+    if (m === "tsumo") {
+      ruleHint.textContent = `規則：自摸 → 其餘三家各付（有效台數 ${eff} × 台錢 ${unit}）給胡牌者`;
+    } else {
+      ruleHint.textContent = `規則：放槍 → 放槍者付（3 × 有效台數 ${eff} × 台錢 ${unit}）給胡牌者`;
+    }
+  }
+
+  // delta[i]：本局輸贏（金額）
+  function settleRound({winner, method, loser, effFan, unit}) {
+    const delta = [0,0,0,0];
+    const amount = effFan * unit;
+
+    if (method === "tsumo") {
+      for (let i=0;i<4;i++) {
+        if (i === winner) continue;
+        delta[i] -= amount;
+        delta[winner] += amount;
+      }
+    } else if (method === "ron") {
+      if (loser === winner) throw new Error("胡牌者與放槍者不能同一人");
+      const pay = amount * 3;
+      delta[loser] -= pay;
+      delta[winner] += pay;
+    } else {
+      throw new Error("未知方式");
+    }
+    return delta;
+  }
+
+  function applyDelta(delta) {
+    for (let i=0;i<4;i++) state.total[i] += delta[i];
+    state.lastDelta = delta;
+    renderScores(delta);
+  }
+
+  function undo() {
+    if (!state.lastDelta) return;
+    for (let i=0;i<4;i++) state.total[i] -= state.lastDelta[i];
+    state.lastDelta = null;
+    renderScores([0,0,0,0]);
+  }
+
+  function resetAll() {
+    state.total = [0,0,0,0];
+    state.lastDelta = null;
+    renderScores([0,0,0,0]);
+  }
+
+  // events
+  [0,1,2,3].forEach(i => {
+    $("p"+i).addEventListener("input", () => {
+      refreshPlayersFromInputs();
+      fillSelectOptions();
+      renderScores([0,0,0,0]);
+    });
+  });
+
+  ["unit","base","streak","perStreak","fan"].forEach(id => {
+    $(id).addEventListener("input", updateRuleHint);
+  });
+
+  $("method").addEventListener("change", methodChanged);
+
+  $("settleBtn").addEventListener("click", () => {
+    try {
+      const winner = Number($("winner").value);
+      const method = $("method").value;
+      const loser = Number($("loser").value);
+
+      const { unit, base, streak, perStreak, fan } = readSettings();
+      const eff = effectiveFan({base, streak, perStreak, fan});
+
+      if (!Number.isFinite(eff) || eff < 0) throw new Error("有效台數不合法");
+
+      const delta = settleRound({
+        winner, method, loser,
+        effFan: Math.floor(eff),
+        unit: unit
+      });
+      applyDelta(delta);
+      updateRuleHint();
+    } catch (e) {
+      alert(e.message || String(e));
+    }
+  });
+
+  $("undoBtn").addEventListener("click", undo);
+  $("resetBtn").addEventListener("click", resetAll);
+
+  // init
+  refreshPlayersFromInputs();
+  fillSelectOptions();
+  methodChanged();
+  updateRuleHint();
+  renderScores([0,0,0,0]);
+</script>
+</body>
+</html>
